@@ -37,12 +37,16 @@ pub fn process_display_device_name() -> String {
         .clone()
 }
 
-/// Picks one adjective and one noun, title-cased, separated by a space.
+/// Picks one adjective and one noun plus a random number 1-999, title-cased,
+/// separated by spaces — e.g. `Quiet River 42`.
+/// 28 × 31 × 999 = 867,132 distinct combinations.
 pub fn random_device_name() -> String {
+    use rand::Rng;
     let mut rng = rand::thread_rng();
     let a = DEVICE_NAME_ADJECTIVES.choose(&mut rng).unwrap();
     let n = DEVICE_NAME_NOUNS.choose(&mut rng).unwrap();
-    format!("{} {}", capitalize_word(a), capitalize_word(n))
+    let num: u16 = rng.gen_range(1..=999);
+    format!("{} {} {}", capitalize_word(a), capitalize_word(n), num)
 }
 
 fn capitalize_word(word: &str) -> String {
@@ -70,10 +74,13 @@ mod tests {
     use super::random_device_name;
 
     #[test]
-    fn random_device_name_is_two_words() {
+    fn random_device_name_is_three_words() {
         let s = random_device_name();
-        assert_eq!(s.split_whitespace().count(), 2);
+        assert_eq!(s.split_whitespace().count(), 3);
         assert!(s.chars().next().unwrap().is_uppercase());
+        // third token is a number 1-999
+        let num: u16 = s.split_whitespace().nth(2).unwrap().parse().unwrap();
+        assert!((1..=999).contains(&num));
     }
 
     #[test]

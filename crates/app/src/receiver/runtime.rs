@@ -340,7 +340,12 @@ impl ReceiverRuntime {
             return;
         }
 
-        self.clear_advertising();
+        // Already advertising — keep the existing advertisement alive instead of
+        // tearing it down and re-creating it (which causes a gap in mDNS coverage
+        // and triggers repeated `lan_advertisement.starting` log entries).
+        if self.advertising.is_some() {
+            return;
+        }
         let ticket = match make_ticket(&self.endpoint).await {
             Ok(ticket) => ticket,
             Err(error) => {

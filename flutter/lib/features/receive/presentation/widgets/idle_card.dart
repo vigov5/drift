@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import '../../../../theme/drift_theme.dart';
 import '../../application/state.dart';
+import 'broadcast_status_icon.dart';
 
 class ReceiveIdleCard extends StatefulWidget {
   const ReceiveIdleCard({super.key, required this.state, this.onOpenSettings});
@@ -59,16 +60,27 @@ class _ReceiveIdleCardState extends State<ReceiveIdleCard> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  widget.state.deviceName,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: driftSans(
-                    fontSize: 13.5,
-                    fontWeight: FontWeight.w600,
-                    color: kInk,
-                    letterSpacing: -0.25,
-                  ),
+                Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        widget.state.deviceName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: driftSans(
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.w600,
+                          color: kInk,
+                          letterSpacing: -0.25,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    BroadcastStatusIcon(
+                      active: widget.state.advertisingActive,
+                      size: 16,
+                    ),
+                  ],
                 ),
                 const SizedBox(height: 2),
                 Row(

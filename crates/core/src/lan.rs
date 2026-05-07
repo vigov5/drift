@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::error::Error as StdError;
+use std::io::ErrorKind;
 use std::mem::ManuallyDrop;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,7 @@ use iroh::EndpointId;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo, TxtProperties};
 use rand::seq::SliceRandom;
 use thiserror::Error;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use crate::protocol::DeviceType;
 /// DNS-SD type for drift receivers on the LAN (`drift` ≤ 15 bytes per RFC 6763).
@@ -24,6 +25,9 @@ pub const DRIFT_MDNS_TXT_VER: &str = "1";
 /// UDP port for presence ping/pong (SRV port in mDNS). Not the iroh data plane.
 pub const DRIFT_LAN_PRESENCE_PORT: u16 = 47_474;
 
+/// UDP port for broadcast discovery (works on Android hotspot where mDNS multicast is blocked).
+pub const DRIFT_LAN_DISCOVERY_PORT: u16 = 47_475;
+
 const TICKET_CHUNK_LEN: usize = 200;
 
 const PRESENCE_MAGIC: &[u8; 4] = b"DRFP";
@@ -31,6 +35,35 @@ const PRESENCE_VER: u16 = 1;
 const OP_PING: u8 = 1;
 const OP_PONG: u8 = 2;
 const PRESENCE_PKT_LEN: usize = 16;
+
+// Broadcast discovery protocol (DRFD = Drift Discovery).
+// Query:  16 bytes fixed  — sender broadcasts to 255.255.255.255:DRIFT_LAN_DISCOVERY_PORT
+// Reply:  variable length — receiver unicasts back ticket + label
+const DISCOVERY_MAGIC: &[u8; 4] = b"DRFD";
+const DISCOVERY_VER: u16 = 1;
+const OP_QUERY: u8 = 1;
+const OP_DREPLY: u8 = 2;
+const DISCOVERY_QUERY_LEN: usize = 16;
+
+/// How long a cached endpoint IP stays valid between scans.
+const CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Per-process IP cache — maps iroh ticket → last-seen endpoint + receiver metadata.
+/// Allows the next scan to immediately presence-ping known IPs without waiting for a
+/// fresh mDNS re-announce (SRV TTL = 120 s).
+struct CachedEntry {
+    ip: Ipv4Addr,
+    /// Presence-ping port (always DRIFT_LAN_PRESENCE_PORT for confirmed peers).
+    port: u16,
+    receiver: NearbyReceiver,
+    seen_at: Instant,
+}
+
+static PEER_CACHE: OnceLock<Mutex<HashMap<String, CachedEntry>>> = OnceLock::new();
+
+fn peer_cache() -> &'static Mutex<HashMap<String, CachedEntry>> {
+    PEER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Error)]
 pub enum LanError {
@@ -59,33 +92,21 @@ pub enum LanError {
     PresenceInvalidPong,
 }
 
-fn default_route_ipv4() -> std::result::Result<Ipv4Addr, LanError> {
-    let probes = ["1.1.1.1:53", "8.8.8.8:53", "192.0.2.1:1"];
-    for probe in probes {
-        if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
-            if socket.connect(probe).is_ok() {
-                if let Ok(SocketAddr::V4(addr)) = socket.local_addr() {
-                    let ip = *addr.ip();
-                    if !ip.is_unspecified() && !ip.is_loopback() {
-                        return Ok(ip);
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: search for any non-loopback IPv4 interface
-    if let Ok(addrs) = if_addrs::get_if_addrs() {
-        for iface in addrs {
-            if !iface.is_loopback() {
-                if let IpAddr::V4(ip) = iface.ip() {
-                    return Ok(ip);
-                }
-            }
-        }
-    }
-
-    Err(LanError::NoUsableIpv4Address)
+/// Collects all non-loopback IPv4 addresses across every local interface.
+///
+/// VPN / tunnel interfaces are included intentionally: the advertiser publishes
+/// all of them, and the scanner pings each one — the real Wi-Fi IP answers
+/// while VPN IPs silently time out, so the device is still discovered.
+fn all_local_ipv4_addrs() -> Vec<Ipv4Addr> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|iface| !iface.is_loopback())
+        .filter_map(|iface| match iface.addr.ip() {
+            IpAddr::V4(ip) => Some(ip),
+            _ => None,
+        })
+        .collect()
 }
 
 fn chunk_ascii(s: &str, max: usize) -> Vec<String> {
@@ -191,19 +212,50 @@ pub fn presence_ping(target: SocketAddr, timeout: Duration) -> std::result::Resu
     Ok(())
 }
 
-/// Tries each IPv4 until one answers presence ping.
-fn verify_presence(info: &mdns_sd::ResolvedService) -> bool {
+/// Tries each IPv4 until one answers the presence ping; returns the responding address.
+fn verify_presence(info: &mdns_sd::ResolvedService) -> Option<Ipv4Addr> {
     if info.get_port() != DRIFT_LAN_PRESENCE_PORT {
-        return false;
+        warn!(
+            service = %info.get_fullname(),
+            port = info.get_port(),
+            expected = DRIFT_LAN_PRESENCE_PORT,
+            "lan_scan.verify_presence: wrong port — skipping",
+        );
+        return None;
+    }
+    let addrs: Vec<_> = info.get_addresses_v4().into_iter().collect();
+    if addrs.is_empty() {
+        warn!(service = %info.get_fullname(), "lan_scan.verify_presence: no IPv4 addresses in record");
+        return None;
     }
     let timeout = Duration::from_millis(400);
-    for ip in info.get_addresses_v4() {
-        let target = SocketAddr::new(IpAddr::V4(ip), info.get_port());
-        if presence_ping(target, timeout).is_ok() {
-            return true;
+    for ip in &addrs {
+        let target = SocketAddr::new(IpAddr::V4(*ip), info.get_port());
+        match presence_ping(target, timeout) {
+            Ok(()) => {
+                debug!(
+                    service = %info.get_fullname(),
+                    %target,
+                    "lan_scan.presence_ping: OK",
+                );
+                return Some(*ip);
+            }
+            Err(ref e) => {
+                debug!(
+                    service = %info.get_fullname(),
+                    %target,
+                    error = %e,
+                    "lan_scan.presence_ping: failed",
+                );
+            }
         }
     }
-    false
+    warn!(
+        service = %info.get_fullname(),
+        ips = ?addrs,
+        "lan_scan.verify_presence: all IPs failed ping — device not reachable",
+    );
+    None
 }
 
 /// Answers [`DRIFT_LAN_PRESENCE_PORT`] UDP datagrams while alive.
@@ -284,32 +336,282 @@ fn run_presence_loop(socket: UdpSocket, stop: Arc<AtomicBool>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Broadcast discovery responder (receiver side)
+// ---------------------------------------------------------------------------
+
+/// Listens on [`DRIFT_LAN_DISCOVERY_PORT`] for UDP broadcast QUERY packets and
+/// replies unicast with the device's ticket + label.  Works on Android hotspot
+/// where mDNS multicast is blocked by the SoftAP driver.
+pub struct BroadcastDiscoveryResponder {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl BroadcastDiscoveryResponder {
+    pub fn bind(
+        port: u16,
+        ticket: String,
+        label: String,
+        device_type: DeviceType,
+    ) -> std::result::Result<Self, LanError> {
+        let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).map_err(|source| {
+            LanError::Io {
+                context: "binding broadcast discovery UDP",
+                source,
+            }
+        })?;
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .map_err(|source| LanError::Io {
+                context: "broadcast discovery set_read_timeout",
+                source,
+            })?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = Arc::clone(&stop);
+        let join = std::thread::Builder::new()
+            .name("drift-lan-discovery".into())
+            .spawn(move || run_discovery_responder_loop(socket, stop_t, ticket, label, device_type))
+            .map_err(|source| LanError::SpawnPresenceThread { source })?;
+
+        Ok(Self {
+            stop,
+            join: Some(join),
+        })
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+impl Drop for BroadcastDiscoveryResponder {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn run_discovery_responder_loop(
+    socket: UdpSocket,
+    stop: Arc<AtomicBool>,
+    ticket: String,
+    label: String,
+    device_type: DeviceType,
+) {
+    let dt_byte: u8 = match device_type {
+        DeviceType::Phone => 1,
+        DeviceType::Laptop => 0,
+    };
+    let label_bytes = label.as_bytes();
+    let ticket_bytes = ticket.as_bytes();
+
+    let mut buf = [0u8; 256];
+    while !stop.load(Ordering::SeqCst) {
+        match socket.recv_from(&mut buf) {
+            Ok((n, from)) => {
+                if n < DISCOVERY_QUERY_LEN {
+                    continue;
+                }
+                let p = &buf[..n];
+                if &p[0..4] != DISCOVERY_MAGIC {
+                    continue;
+                }
+                if u16::from_be_bytes([p[4], p[5]]) != DISCOVERY_VER {
+                    continue;
+                }
+                if p[6] != OP_QUERY {
+                    continue;
+                }
+                let nonce = u64::from_be_bytes(p[8..16].try_into().unwrap());
+
+                // Build variable-length reply: header + label + ticket
+                let mut reply = Vec::with_capacity(
+                    DISCOVERY_QUERY_LEN + 4 + label_bytes.len() + ticket_bytes.len(),
+                );
+                reply.extend_from_slice(DISCOVERY_MAGIC);
+                reply.extend_from_slice(&DISCOVERY_VER.to_be_bytes());
+                reply.push(OP_DREPLY);
+                reply.push(dt_byte);
+                reply.extend_from_slice(&nonce.to_be_bytes());
+                reply.extend_from_slice(&(label_bytes.len() as u16).to_be_bytes());
+                reply.extend_from_slice(label_bytes);
+                reply.extend_from_slice(&(ticket_bytes.len() as u16).to_be_bytes());
+                reply.extend_from_slice(ticket_bytes);
+
+                debug!(%from, "lan_discovery.query_received - sending reply");
+                let _ = socket.send_to(&reply, from);
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+            Err(_) => break,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast discovery scanner (sender side)
+// ---------------------------------------------------------------------------
+
+fn parse_discovery_reply(buf: &[u8], expected_nonce: u64) -> Option<NearbyReceiver> {
+    if buf.len() < DISCOVERY_QUERY_LEN + 4 {
+        return None;
+    }
+    if &buf[0..4] != DISCOVERY_MAGIC {
+        return None;
+    }
+    if u16::from_be_bytes([buf[4], buf[5]]) != DISCOVERY_VER {
+        return None;
+    }
+    if buf[6] != OP_DREPLY {
+        return None;
+    }
+    let device_type = if buf[7] == 1 {
+        DeviceType::Phone
+    } else {
+        DeviceType::Laptop
+    };
+    let nonce = u64::from_be_bytes(buf[8..16].try_into().ok()?);
+    if nonce != expected_nonce {
+        return None;
+    }
+
+    let mut pos = 16usize;
+    let label_len = u16::from_be_bytes([*buf.get(pos)?, *buf.get(pos + 1)?]) as usize;
+    pos += 2;
+    let label = String::from_utf8(buf.get(pos..pos + label_len)?.to_vec()).ok()?;
+    pos += label_len;
+    let ticket_len = u16::from_be_bytes([*buf.get(pos)?, *buf.get(pos + 1)?]) as usize;
+    pos += 2;
+    let ticket = String::from_utf8(buf.get(pos..pos + ticket_len)?.to_vec()).ok()?;
+
+    Some(NearbyReceiver {
+        fullname: format!("broadcast-{}", &ticket[..ticket.len().min(12)]),
+        label,
+        device_type,
+        code: String::new(),
+        ticket,
+    })
+}
+
+/// Sends a UDP broadcast query and collects replies for `timeout`.
+/// Works on networks where mDNS multicast is blocked (e.g. Android hotspot).
+/// Returns each found receiver together with the unicast source IP of its reply.
+fn broadcast_scan(timeout: Duration, nonce: u64) -> Vec<(NearbyReceiver, Ipv4Addr)> {
+    let socket = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "lan_scan.broadcast_scan: bind failed");
+            return vec![];
+        }
+    };
+    if let Err(e) = socket.set_broadcast(true) {
+        warn!(error = %e, "lan_scan.broadcast_scan: set_broadcast failed");
+        return vec![];
+    }
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(300)));
+
+    let mut query = [0u8; DISCOVERY_QUERY_LEN];
+    query[0..4].copy_from_slice(DISCOVERY_MAGIC);
+    query[4..6].copy_from_slice(&DISCOVERY_VER.to_be_bytes());
+    query[6] = OP_QUERY;
+    query[8..16].copy_from_slice(&nonce.to_be_bytes());
+
+    // Send to global broadcast + per-interface /24 subnet broadcasts.
+    let targets: Vec<SocketAddr> = {
+        let mut t = vec![SocketAddr::from((
+            [255, 255, 255, 255],
+            DRIFT_LAN_DISCOVERY_PORT,
+        ))];
+        for ip in all_local_ipv4_addrs() {
+            let o = ip.octets();
+            let subnet_broadcast = Ipv4Addr::new(o[0], o[1], o[2], 255);
+            t.push(SocketAddr::new(
+                IpAddr::V4(subnet_broadcast),
+                DRIFT_LAN_DISCOVERY_PORT,
+            ));
+        }
+        t.dedup();
+        t
+    };
+    for target in &targets {
+        let _ = socket.send_to(&query, target);
+    }
+    info!(targets = ?targets, "lan_scan.broadcast_query_sent");
+
+    let deadline = Instant::now() + timeout;
+    let mut results: HashMap<String, (NearbyReceiver, Ipv4Addr)> = HashMap::new();
+    let mut buf = vec![0u8; 4096];
+
+    while Instant::now() < deadline {
+        match socket.recv_from(&mut buf) {
+            Ok((n, from)) => {
+                if let Some(receiver) = parse_discovery_reply(&buf[..n], nonce) {
+                    if let IpAddr::V4(ip) = from.ip() {
+                        debug!(%from, label = %receiver.label, "lan_scan.broadcast_reply_received");
+                        results.insert(receiver.ticket.clone(), (receiver, ip));
+                    }
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+            Err(_) => break,
+        }
+    }
+
+    info!(found = results.len(), "lan_scan.broadcast_scan_done");
+    results.into_values().collect()
+}
+
+// ---------------------------------------------------------------------------
+
 /// Holds mDNS registration for `receive`; unregister on drop.
 pub struct LanReceiveAdvertisement {
     fullname: String,
     daemon: ManuallyDrop<ServiceDaemon>,
     presence: ManuallyDrop<PresenceResponder>,
+    discovery: ManuallyDrop<BroadcastDiscoveryResponder>,
 }
 
 impl LanReceiveAdvertisement {
     /// Publishes the given iroh `ticket` (same string as rendezvous) on the LAN.
     ///
-    /// Returns `Ok(None)` when there is no usable IPv4 default route (LAN advertising skipped).
+    /// Returns `Ok(None)` when no IPv4 interface is available.
+    ///
+    /// All non-loopback IPv4 addresses (including VPN tunnel IPs) are included
+    /// in the mDNS record via [`ServiceInfo::enable_addr_auto`].  The scanner
+    /// pings every advertised address; whichever one responds (the real Wi-Fi
+    /// IP) determines whether the device is shown.
     pub fn start(
         ticket: &str,
         device_label: &str,
         device_type: DeviceType,
     ) -> std::result::Result<Option<Self>, LanError> {
-        let ip = match default_route_ipv4() {
-            Ok(ip) => ip,
-            Err(_) => return Ok(None),
+        let all_ips = all_local_ipv4_addrs();
+        let seed_ip = match all_ips.first().copied() {
+            Some(ip) => ip,
+            None => {
+                info!("lan_advertisement.no_ipv4_interface — skipping");
+                return Ok(None);
+            }
         };
-        info!(%ip, %device_label, "lan_advertisement.starting");
+        info!(advertised_ips = ?all_ips, %device_label, "lan_advertisement.starting");
 
         let presence = PresenceResponder::bind(DRIFT_LAN_PRESENCE_PORT)
             .map_err(|source| LanError::mdns("starting LAN presence responder", source))?;
 
-        let host_name = format!("{ip}.local.");
+        let discovery = BroadcastDiscoveryResponder::bind(
+            DRIFT_LAN_DISCOVERY_PORT,
+            ticket.to_owned(),
+            device_label.to_owned(),
+            device_type,
+        )
+        .map_err(|source| LanError::mdns("starting LAN broadcast discovery responder", source))?;
+
+        // Use the seed IP only as a required constructor argument; enable_addr_auto()
+        // replaces it with all local addresses so every interface is represented.
+        let host_name = format!("{seed_ip}.local.");
         let instance = random_mdns_instance_name();
 
         let chunks = chunk_ascii(ticket, TICKET_CHUNK_LEN);
@@ -332,7 +634,7 @@ impl LanReceiveAdvertisement {
             DRIFT_MDNS_SERVICE_TYPE,
             &instance,
             &host_name,
-            IpAddr::V4(ip),
+            IpAddr::V4(seed_ip),
             DRIFT_LAN_PRESENCE_PORT,
             txt.as_slice(),
         )
@@ -350,6 +652,7 @@ impl LanReceiveAdvertisement {
             fullname,
             daemon: ManuallyDrop::new(daemon),
             presence: ManuallyDrop::new(presence),
+            discovery: ManuallyDrop::new(discovery),
         }))
     }
 }
@@ -362,6 +665,7 @@ impl Drop for LanReceiveAdvertisement {
         std::thread::sleep(Duration::from_millis(100));
         unsafe {
             ManuallyDrop::drop(&mut self.presence);
+            ManuallyDrop::drop(&mut self.discovery);
         }
         if let Ok(rx) = self.daemon.shutdown() {
             let _ = rx.recv_timeout(Duration::from_secs(2));
@@ -393,14 +697,62 @@ pub fn browse_nearby_receivers(
     scan: Duration,
     exclude_endpoint_id: Option<EndpointId>,
 ) -> std::result::Result<Vec<NearbyReceiver>, LanError> {
+    let local_ips = all_local_ipv4_addrs();
+    info!(ips = ?local_ips, scan_secs = scan.as_secs(), "lan_scan.browse_start");
+
+    // Run UDP broadcast scan in a parallel thread so it overlaps with mDNS.
+    let nonce: u64 = rand::random();
+    let broadcast_handle = std::thread::spawn(move || broadcast_scan(scan, nonce));
+
+    // Snapshot the IP cache and start pinging known IPs in parallel threads.
+    // Each ping has a 300 ms deadline; since they run concurrently the total
+    // wait is bounded by one ping round-trip regardless of how many entries exist.
+    let cache_snapshot: Vec<(String, Ipv4Addr, u16, NearbyReceiver)> = {
+        let cache = peer_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        cache
+            .iter()
+            .filter(|(_, e)| now.duration_since(e.seen_at) < CACHE_TTL)
+            .map(|(t, e)| (t.clone(), e.ip, e.port, e.receiver.clone()))
+            .collect()
+    };
+    let cache_ping_handles: Vec<_> = cache_snapshot
+        .into_iter()
+        .map(|(ticket, ip, port, receiver)| {
+            std::thread::spawn(move || {
+                let target = SocketAddr::new(IpAddr::V4(ip), port);
+                match presence_ping(target, Duration::from_millis(300)) {
+                    Ok(()) => {
+                        debug!(%ip, %port, label = %receiver.label, "lan_scan.cache_hit");
+                        Some((ticket, ip, port, receiver))
+                    }
+                    Err(_) => None,
+                }
+            })
+        })
+        .collect();
+
     let daemon =
         ServiceDaemon::new().map_err(|source| LanError::mdns("creating mDNS daemon", source))?;
     let browse_rx = daemon
         .browse(DRIFT_MDNS_SERVICE_TYPE)
         .map_err(|source| LanError::mdns("starting mDNS browse", source))?;
 
-    let deadline = Instant::now() + scan;
+    // Collect cache hits (≤300 ms, overlaps with mDNS daemon startup).
+    // Both maps are keyed by *ticket* so mDNS and broadcast results dedup naturally.
     let mut peers: HashMap<String, NearbyReceiver> = HashMap::new();
+    let mut peer_ips: HashMap<String, (Ipv4Addr, u16)> = HashMap::new();
+    for handle in cache_ping_handles {
+        if let Ok(Some((ticket, ip, port, receiver))) = handle.join() {
+            peer_ips.entry(ticket.clone()).or_insert((ip, port));
+            peers.entry(ticket).or_insert(receiver);
+        }
+    }
+    if !peers.is_empty() {
+        info!(seeded = peers.len(), "lan_scan.cache_seeded");
+    }
+
+    let deadline = Instant::now() + scan;
 
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -411,25 +763,45 @@ pub fn browse_nearby_receivers(
 
         match browse_rx.recv_timeout(wait) {
             Ok(ServiceEvent::ServiceResolved(info)) => {
+                let addrs: Vec<_> = info.get_addresses_v4().into_iter().collect();
+                debug!(
+                    service = %info.get_fullname(),
+                    ips = ?addrs,
+                    port = info.get_port(),
+                    "lan_scan.service_resolved",
+                );
+
                 if !info.is_valid() {
+                    warn!(service = %info.get_fullname(), "lan_scan.filter: invalid service");
                     continue;
                 }
-                if info.get_properties().get_property_val_str("ver") != Some(DRIFT_MDNS_TXT_VER) {
+                let ver = info.get_properties().get_property_val_str("ver");
+                if ver != Some(DRIFT_MDNS_TXT_VER) {
+                    warn!(
+                        service = %info.get_fullname(),
+                        got = ?ver,
+                        expected = DRIFT_MDNS_TXT_VER,
+                        "lan_scan.filter: ver mismatch",
+                    );
                     continue;
                 }
                 let Some(ticket) = ticket_from_txt(info.get_properties()) else {
+                    warn!(service = %info.get_fullname(), "lan_scan.filter: missing ticket TXT");
                     continue;
                 };
-                if !verify_presence(&info) {
+                let Some(ip) = verify_presence(&info) else {
                     continue;
-                }
+                };
                 let label = info
                     .get_properties()
                     .get_property_val_str("label")
                     .unwrap_or("Drift receiver")
                     .to_owned();
+                info!(service = %info.get_fullname(), %label, "lan_scan.peer_added");
+                // mDNS is authoritative — always overwrite cache-seeded entry.
+                peer_ips.insert(ticket.clone(), (ip, DRIFT_LAN_PRESENCE_PORT));
                 peers.insert(
-                    info.get_fullname().to_owned(),
+                    ticket.clone(),
                     NearbyReceiver {
                         fullname: info.get_fullname().to_owned(),
                         label,
@@ -439,17 +811,58 @@ pub fn browse_nearby_receivers(
                     },
                 );
             }
-            Ok(ServiceEvent::ServiceRemoved(_ty_domain, instance_fullname)) => {
-                peers.remove(&instance_fullname);
+            Ok(ServiceEvent::ServiceRemoved(_ty_domain, fullname)) => {
+                // Peers are now keyed by ticket, so we can't remove by fullname directly.
+                // Flutter-side staleness handling takes care of eventually evicting gone peers.
+                debug!(service = %fullname, "lan_scan.service_removed (ignored — keyed by ticket)");
             }
-            Ok(_) => {}
+            Ok(ev) => {
+                debug!(event = ?ev, "lan_scan.mdns_event");
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+    info!(mdns_found = peers.len(), "lan_scan.browse_done");
 
     if let Ok(rx) = daemon.shutdown() {
         let _ = rx.recv_timeout(Duration::from_secs(2));
+    }
+
+    // Merge broadcast results — dedup by ticket (prefer mDNS entry when both found).
+    if let Ok(broadcast_results) = broadcast_handle.join() {
+        for (peer, ip) in broadcast_results {
+            let ticket = peer.ticket.clone();
+            // Record IP for cache update (don't overwrite if mDNS already has it).
+            peer_ips
+                .entry(ticket.clone())
+                .or_insert((ip, DRIFT_LAN_PRESENCE_PORT));
+            // Only insert if this ticket wasn't already seen via mDNS.
+            peers.entry(ticket).or_insert(peer);
+        }
+    }
+    info!(total = peers.len(), "lan_scan.merged");
+
+    // Persist discovered endpoints to the cross-scan IP cache.
+    {
+        let mut cache = peer_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        for (ticket, receiver) in &peers {
+            if let Some(&(ip, port)) = peer_ips.get(ticket) {
+                cache.insert(
+                    ticket.clone(),
+                    CachedEntry {
+                        ip,
+                        port,
+                        receiver: receiver.clone(),
+                        seen_at: now,
+                    },
+                );
+            }
+        }
+        // Evict entries older than CACHE_TTL.
+        cache.retain(|_, e| now.duration_since(e.seen_at) < CACHE_TTL);
+        debug!(cache_size = cache.len(), "lan_scan.cache_updated");
     }
 
     let mut list: Vec<NearbyReceiver> = peers.into_values().collect();

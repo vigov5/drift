@@ -24,44 +24,86 @@ class SendDestinationSelector extends ConsumerStatefulWidget {
 class _SendDestinationSelectorState
     extends ConsumerState<SendDestinationSelector> {
   List<NearbyReceiver> _nearbyDevices = const [];
+  final Map<String, int> _deviceMissCount = {};
   bool _isScanningNearby = false;
   bool _nearbyScanCompletedOnce = false;
+  bool _continuousMode = false;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
-        unawaited(_scanNearby());
+        unawaited(_startContinuousScan());
       }
     });
   }
 
-  Future<void> _scanNearby() async {
+  @override
+  void dispose() {
+    _continuousMode = false;
+    super.dispose();
+  }
+
+  Future<void> _startContinuousScan() async {
+    if (_isScanningNearby) return;
     setState(() {
+      _continuousMode = true;
       _isScanningNearby = true;
     });
+    await _runScanLoop();
+  }
 
-    try {
-      final devices = await ref
-          .read(receiverServiceProvider.notifier)
-          .scanNearby(timeout: const Duration(seconds: 4));
-      if (!mounted) {
-        return;
+  void _stopScan() {
+    _deviceMissCount.clear();
+    setState(() {
+      _continuousMode = false;
+      _isScanningNearby = false;
+    });
+  }
+
+  Future<void> _runScanLoop() async {
+    while (mounted && _continuousMode) {
+      try {
+        final devices = await ref
+            .read(receiverServiceProvider.notifier)
+            .scanNearby(timeout: const Duration(seconds: 3));
+        if (!mounted || !_continuousMode) break;
+        // Merge results: add/refresh seen devices, tolerate up to 2 consecutive
+        // missed rounds before removing (prevents flicker on intermittent scans).
+        final fresh = devices.map((d) => d.fullname).toSet();
+        final merged = <String, NearbyReceiver>{};
+        for (final d in _nearbyDevices) {
+          merged[d.fullname] = d;
+        }
+        for (final d in devices) {
+          merged[d.fullname] = d;
+          _deviceMissCount.remove(d.fullname); // seen this round → reset
+        }
+        for (final key in merged.keys.toList()) {
+          if (!fresh.contains(key)) {
+            final misses = (_deviceMissCount[key] ?? 0) + 1;
+            _deviceMissCount[key] = misses;
+            if (misses >= 2) {
+              merged.remove(key);
+              _deviceMissCount.remove(key);
+            }
+          }
+        }
+        setState(() {
+          _nearbyDevices = merged.values.toList();
+          _nearbyScanCompletedOnce = true;
+        });
+      } catch (_) {
+        if (!mounted || !_continuousMode) break;
+        setState(() {
+          _nearbyScanCompletedOnce = true;
+        });
       }
+    }
+    if (mounted) {
       setState(() {
-        _nearbyDevices = devices;
         _isScanningNearby = false;
-        _nearbyScanCompletedOnce = true;
-      });
-    } catch (_) {
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _nearbyDevices = const [];
-        _isScanningNearby = false;
-        _nearbyScanCompletedOnce = true;
       });
     }
   }
@@ -89,7 +131,12 @@ class _SendDestinationSelectorState
           children: [
             Text('Nearby devices', style: titleStyle),
             const Spacer(),
-            _ScanAction(isScanning: _isScanningNearby, onPressed: _scanNearby),
+            _ScanAction(
+              isScanning: _isScanningNearby,
+              isContinuous: _continuousMode,
+              onStart: _startContinuousScan,
+              onStop: _stopScan,
+            ),
           ],
         ),
         const SizedBox(height: 12),
@@ -113,6 +160,7 @@ class _SendDestinationSelectorState
                 return _NearbyDeviceTile(
                   receiver: receiver,
                   isSelected: selected,
+                  isStale: _deviceMissCount.containsKey(receiver.fullname),
                   icon: _deviceIconForType(receiver.deviceType),
                   onTap: () => widget.controller.selectNearbyReceiver(receiver),
                 );
@@ -141,41 +189,67 @@ class _SendDestinationSelectorState
 }
 
 class _ScanAction extends StatelessWidget {
-  const _ScanAction({required this.isScanning, required this.onPressed});
+  const _ScanAction({
+    required this.isScanning,
+    required this.isContinuous,
+    required this.onStart,
+    required this.onStop,
+  });
 
   final bool isScanning;
-  final VoidCallback onPressed;
+  final bool isContinuous;
+  final VoidCallback onStart;
+  final VoidCallback onStop;
 
   @override
   Widget build(BuildContext context) {
+    const color = Color(0xFF7AAFC9);
+    const style = ButtonStyle(
+      padding: WidgetStatePropertyAll(EdgeInsets.zero),
+      minimumSize: WidgetStatePropertyAll(Size.zero),
+      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      foregroundColor: WidgetStatePropertyAll(color),
+    );
+
+    if (isScanning && isContinuous) {
+      return TextButton.icon(
+        onPressed: onStop,
+        icon: const Icon(Icons.stop_rounded, size: 18),
+        label: Text(
+          'Stop',
+          style: driftSans(
+            fontSize: 13,
+            fontWeight: FontWeight.w500,
+            color: color,
+          ),
+        ),
+        style: style,
+      );
+    }
+
     if (isScanning) {
       return const SizedBox(
         width: 20,
         height: 20,
         child: CircularProgressIndicator(
           strokeWidth: 2,
-          valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF8FB9CA)),
+          valueColor: AlwaysStoppedAnimation<Color>(color),
         ),
       );
     }
 
     return TextButton.icon(
-      onPressed: onPressed,
+      onPressed: onStart,
       icon: const Icon(Icons.refresh_rounded, size: 18),
       label: Text(
         'Rescan',
         style: driftSans(
           fontSize: 13,
           fontWeight: FontWeight.w500,
-          color: const Color(0xFF7AAFC9),
+          color: color,
         ),
       ),
-      style: TextButton.styleFrom(
-        foregroundColor: const Color(0xFF7AAFC9),
-        padding: EdgeInsets.zero,
-        minimumSize: Size.zero,
-        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-      ),
+      style: style,
     );
   }
 }
@@ -258,53 +332,63 @@ class _NearbyDeviceTile extends StatelessWidget {
   const _NearbyDeviceTile({
     required this.receiver,
     required this.isSelected,
+    required this.isStale,
     required this.icon,
     required this.onTap,
   });
 
   final NearbyReceiver receiver;
   final bool isSelected;
+  final bool isStale;
   final IconData icon;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(20),
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 200),
-        width: 106,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-        decoration: BoxDecoration(
-          color: isSelected ? const Color(0xFFF4F8FA) : kSurface,
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(
-            color: isSelected ? const Color(0xFF8DBED4) : kBorder,
+    return AnimatedOpacity(
+      duration: const Duration(milliseconds: 300),
+      opacity: isStale ? 0.45 : 1.0,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(20),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          width: 106,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          decoration: BoxDecoration(
+            color: isSelected ? const Color(0xFFF4F8FA) : kSurface,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: isSelected
+                  ? const Color(0xFF8DBED4)
+                  : isStale
+                  ? kBorder.withValues(alpha: 0.5)
+                  : kBorder,
+            ),
           ),
-        ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(
-              icon,
-              size: 20,
-              color: isSelected ? const Color(0xFF7AAFC9) : kMuted,
-            ),
-            const SizedBox(height: 10),
-            Text(
-              receiver.label,
-              style: driftSans(
-                fontSize: 12.5,
-                fontWeight: FontWeight.w600,
-                color: kInk,
-                height: 1.18,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                icon,
+                size: 20,
+                color: isSelected ? const Color(0xFF7AAFC9) : kMuted,
               ),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              textAlign: TextAlign.center,
-            ),
-          ],
+              const SizedBox(height: 10),
+              Text(
+                receiver.label,
+                style: driftSans(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w600,
+                  color: kInk,
+                  height: 1.18,
+                ),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+              ),
+            ],
+          ),
         ),
       ),
     );
