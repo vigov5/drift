@@ -5,8 +5,13 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../features/receive/application/service.dart';
+import '../features/send/application/controller.dart';
+import '../features/send/application/state.dart';
+import '../features/transfers/application/service.dart';
+import '../features/transfers/application/state.dart';
 import 'app_router.dart';
 import '../theme/drift_theme.dart';
+import '../platform/android/keepalive_lifecycle_observer.dart';
 import '../platform/rust/receiver/source.dart';
 
 class DriftApp extends ConsumerStatefulWidget {
@@ -19,6 +24,7 @@ class DriftApp extends ConsumerStatefulWidget {
 class _DriftAppState extends ConsumerState<DriftApp> {
   late final GoRouter _router;
   late final ReceiverServiceSource _receiverService;
+  late final KeepaliveLifecycleObserver _keepaliveObserver;
   bool _discoverableEnabled = false;
 
   @override
@@ -28,11 +34,25 @@ class _DriftAppState extends ConsumerState<DriftApp> {
       observers: [DiscoveryRouterObserver(_syncReceiverDiscovery)],
     );
     _receiverService = ref.read(receiverServiceSourceProvider);
+    _keepaliveObserver = KeepaliveLifecycleObserver(
+      hasActiveTransfer: _hasActiveTransfer,
+    );
+    WidgetsBinding.instance.addObserver(_keepaliveObserver);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         _syncReceiverDiscovery();
       }
     });
+  }
+
+  bool _hasActiveTransfer() {
+    final sendState = ref.read(sendControllerProvider);
+    final sendActive =
+        sendState is SendStateTransferring && !sendState.transfer.isTerminal;
+    final receiveActive =
+        ref.read(transfersServiceProvider).phase ==
+        TransferSessionPhase.receiving;
+    return sendActive || receiveActive;
   }
 
   void _syncReceiverDiscovery() {
@@ -51,6 +71,7 @@ class _DriftAppState extends ConsumerState<DriftApp> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(_keepaliveObserver);
     unawaited(_receiverService.setDiscoverable(enabled: false));
     super.dispose();
   }

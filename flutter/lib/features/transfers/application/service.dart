@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../platform/android/transfer_keepalive_channel.dart';
 import '../../../platform/rust/receiver/fake_source.dart';
 import '../../../platform/rust/receiver/source.dart';
 import '../../../src/rust/api/receiver.dart' as rust_receiver;
@@ -24,6 +25,7 @@ class TransfersServiceController extends Notifier<TransferSessionState> {
   StreamSubscription<rust_receiver.ReceiverTransferEvent>? _subscription;
   TransferIncomingOffer? _incomingOffer;
   DateTime? _transferStartTime;
+  DateTime? _lastKeepaliveAt;
 
   @override
   TransferSessionState build() {
@@ -49,7 +51,11 @@ class TransfersServiceController extends Notifier<TransferSessionState> {
           } else if (freshPath != _incomingOffer!.connectionPath) {
             _incomingOffer = _incomingOffer!.copyWith(connectionPath: freshPath);
           }
-          _transferStartTime ??= DateTime.now();
+          if (_transferStartTime == null) {
+            _transferStartTime = DateTime.now();
+            _startKeepalive(senderName: _incomingOffer!.sender.displayName);
+          }
+          _maybeUpdateKeepalive(event: event);
           state = TransferSessionState.receiving(
             offer: _incomingOffer!,
             progress: _mapProgress(event),
@@ -58,6 +64,7 @@ class TransfersServiceController extends Notifier<TransferSessionState> {
         case rust_receiver.ReceiverTransferPhase.completed:
           final offer = _mapIncomingOffer(event);
           final result = _mapResult(event);
+          _stopKeepalive();
           unawaited(
             Future.delayed(const Duration(milliseconds: 1000)).then((_) {
               state = TransferSessionState.completed(
@@ -71,6 +78,7 @@ class TransfersServiceController extends Notifier<TransferSessionState> {
           return;
         case rust_receiver.ReceiverTransferPhase.cancelled:
           final offer = _mapIncomingOffer(event);
+          _stopKeepalive();
           state = TransferSessionState.cancelled(
             offer: offer,
             errorMessage: event.error?.message ?? event.statusMessage,
@@ -80,6 +88,7 @@ class TransfersServiceController extends Notifier<TransferSessionState> {
           return;
         case rust_receiver.ReceiverTransferPhase.failed:
           final offer = _mapIncomingOffer(event);
+          _stopKeepalive();
           state = TransferSessionState.failed(
             offer: offer,
             errorMessage: event.error?.message ?? event.statusMessage,
@@ -88,6 +97,7 @@ class TransfersServiceController extends Notifier<TransferSessionState> {
           _transferStartTime = null;
           return;
         case rust_receiver.ReceiverTransferPhase.declined:
+          _stopKeepalive();
           state = const TransferSessionState.idle();
           _incomingOffer = null;
           _transferStartTime = null;
@@ -258,6 +268,38 @@ class TransfersServiceController extends Notifier<TransferSessionState> {
       return null;
     }
     return formatEta(etaSeconds);
+  }
+
+  void _startKeepalive({required String senderName}) {
+    _lastKeepaliveAt = DateTime.now();
+    TransferKeepalive.start(
+      title: 'Drift receiving',
+      body: senderName.isEmpty ? 'Incoming files' : 'from $senderName',
+    ).ignore();
+  }
+
+  void _maybeUpdateKeepalive({
+    required rust_receiver.ReceiverTransferEvent event,
+  }) {
+    final now = DateTime.now();
+    final last = _lastKeepaliveAt;
+    if (last != null && now.difference(last) < const Duration(seconds: 1)) {
+      return;
+    }
+    _lastKeepaliveAt = now;
+    final snapshot = event.snapshot;
+    final transferred = snapshot?.bytesTransferred ?? event.bytesReceived;
+    final total = snapshot?.totalBytes ?? event.totalSizeBytes;
+    final body = total > BigInt.zero
+        ? '${formatBytes(transferred)} / ${formatBytes(total)}'
+        : event.senderName;
+    TransferKeepalive.update(title: 'Drift receiving', body: body).ignore();
+  }
+
+  void _stopKeepalive() {
+    if (_lastKeepaliveAt == null) return;
+    _lastKeepaliveAt = null;
+    TransferKeepalive.stop().ignore();
   }
 
   TransferIncomingOffer? _offerFromFakeSource(ReceiverServiceSource source) {

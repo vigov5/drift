@@ -71,6 +71,7 @@ impl ReceiverService {
         let endpoint = Endpoint::builder(presets::N0)
             .alpns(vec![ALPN.to_vec()])
             .relay_mode(RelayMode::Default)
+            .transport_config(crate::quic_keepalive::build_transport_config())
             .secret_key(config.secret_key.clone())
             .bind()
             .await

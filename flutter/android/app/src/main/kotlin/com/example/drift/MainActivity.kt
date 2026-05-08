@@ -1,13 +1,21 @@
 package com.example.drift
 
+import android.Manifest
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.PowerManager
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.provider.Settings
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -21,9 +29,11 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         private const val CHANNEL = "com.example.drift/file_picker"
+        private const val KEEPALIVE_CHANNEL = "com.example.drift/transfer_keepalive"
         private const val REQUEST_CODE_PICK_FILES = 2001
         private const val REQUEST_CODE_PICK_FOLDER = 2002
         private const val REQUEST_CODE_PICK_SAVE_FOLDER = 2003
+        private const val REQUEST_CODE_POST_NOTIF = 4801
     }
 
     private var pendingResult: MethodChannel.Result? = null
@@ -75,6 +85,67 @@ class MainActivity : FlutterActivity() {
                 "saveToSafUri" -> saveToSafUri(call, result)
                 else -> result.notImplemented()
             }
+        }
+
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            KEEPALIVE_CHANNEL,
+        ).setMethodCallHandler { call, result -> handleKeepaliveCall(call, result) }
+    }
+
+    private fun handleKeepaliveCall(call: MethodCall, result: MethodChannel.Result) {
+        when (call.method) {
+            "start", "update" -> {
+                val title = call.argument<String>("title").orEmpty()
+                val body = call.argument<String>("body").orEmpty()
+                if (call.method == "start") {
+                    ensureNotificationPermission()
+                }
+                val intent = Intent(this, TransferKeepaliveService::class.java)
+                    .putExtra(TransferKeepaliveService.EXTRA_TITLE, title)
+                    .putExtra(TransferKeepaliveService.EXTRA_BODY, body)
+                ContextCompat.startForegroundService(this, intent)
+                result.success(null)
+            }
+            "stop" -> {
+                stopService(Intent(this, TransferKeepaliveService::class.java))
+                result.success(null)
+            }
+            "requestIgnoreBatteryOptimizations" -> {
+                try {
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                        .setData(Uri.parse("package:$packageName"))
+                    startActivity(intent)
+                    result.success(null)
+                } catch (_: ActivityNotFoundException) {
+                    try {
+                        startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                    } catch (_: ActivityNotFoundException) {
+                        // System lacks the settings panel; nothing to surface.
+                    }
+                    result.success(null)
+                }
+            }
+            "isIgnoringBatteryOptimizations" -> {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                result.success(pm.isIgnoringBatteryOptimizations(packageName))
+            }
+            else -> result.notImplemented()
+        }
+    }
+
+    private fun ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val granted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.POST_NOTIFICATIONS,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                REQUEST_CODE_POST_NOTIF,
+            )
         }
     }
 

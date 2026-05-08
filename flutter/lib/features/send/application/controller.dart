@@ -8,6 +8,7 @@ import 'package:riverpod_annotation/riverpod_annotation.dart';
 import 'model.dart';
 import 'item_size.dart';
 import 'directory_size.dart';
+import '../../../platform/android/transfer_keepalive_channel.dart';
 import '../../../platform/android_file_picker.dart';
 import '../../../platform/send_transfer_source.dart';
 import '../../transfers/application/format_utils.dart';
@@ -22,6 +23,7 @@ class SendController extends _$SendController {
   StreamSubscription<SendTransferUpdate>? _transferSubscription;
   final Set<String> _pendingDirectorySizes = <String>{};
   DateTime? _transferStartTime;
+  DateTime? _lastKeepaliveAt;
   int _activeTransferToken = 0;
 
   @override
@@ -187,6 +189,12 @@ class SendController extends _$SendController {
     final transferSource = ref.read(sendTransferSourceProvider);
     final transferToken = ++_activeTransferToken;
     _transferStartTime = DateTime.now();
+    _startKeepalive(
+      destinationLabel:
+          validatedRequest.lanDestinationLabel ??
+          validatedRequest.code ??
+          '',
+    );
     state = SendStateTransferring(
       items: currentState.items,
       destination: currentState.destination,
@@ -319,6 +327,7 @@ class SendController extends _$SendController {
   }
 
   Future<void> _cancelActiveTransfer() async {
+    _stopKeepalive();
     final subscription = _transferSubscription;
     _transferSubscription = null;
     if (subscription != null) {
@@ -441,6 +450,44 @@ class SendController extends _$SendController {
       case SendTransferUpdatePhase.sending:
         state = currentState.copyWith(transfer: nextTransfer);
     }
+    if (update.phase == SendTransferUpdatePhase.sending) {
+      _maybeUpdateKeepalive(
+        bytesSent: update.bytesSent,
+        totalBytes: update.totalBytes,
+        destinationLabel: update.destinationLabel,
+      );
+    }
+  }
+
+  void _startKeepalive({required String destinationLabel}) {
+    _lastKeepaliveAt = DateTime.now();
+    TransferKeepalive.start(
+      title: 'Drift sending',
+      body: destinationLabel,
+    ).ignore();
+  }
+
+  void _maybeUpdateKeepalive({
+    required BigInt bytesSent,
+    required BigInt totalBytes,
+    required String destinationLabel,
+  }) {
+    final now = DateTime.now();
+    final last = _lastKeepaliveAt;
+    if (last != null && now.difference(last) < const Duration(seconds: 1)) {
+      return;
+    }
+    _lastKeepaliveAt = now;
+    final body = totalBytes > BigInt.zero
+        ? '${formatBytes(bytesSent)} / ${formatBytes(totalBytes)}'
+        : destinationLabel;
+    TransferKeepalive.update(title: 'Drift sending', body: body).ignore();
+  }
+
+  void _stopKeepalive() {
+    if (_lastKeepaliveAt == null) return;
+    _lastKeepaliveAt = null;
+    TransferKeepalive.stop().ignore();
   }
 
   void _handleTransferError(
@@ -511,6 +558,8 @@ class SendController extends _$SendController {
     if (currentState is! SendStateTransferring) {
       return;
     }
+
+    _stopKeepalive();
 
     if (result.outcome == SendTransferOutcome.success) {
       await Future.delayed(const Duration(milliseconds: 1000));

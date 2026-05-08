@@ -134,6 +134,7 @@ impl SendSession {
                 iroh_blobs::ALPN.to_vec(),
             ])
             .relay_mode(RelayMode::Default)
+            .transport_config(crate::quic_keepalive::build_transport_config())
             .secret_key(iroh::SecretKey::from_bytes(&random::<[u8; 32]>()))
             .bind()
             .await

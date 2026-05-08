@@ -9,6 +9,7 @@ import '../../../../theme/drift_theme.dart';
 import '../../../../platform/rust/rendezvous_defaults.dart';
 import '../../application/controller.dart';
 import '../../settings_providers.dart';
+import 'reliability_settings_section.dart';
 import 'settings_error_banner.dart';
 import 'settings_download_root_field.dart';
 import 'settings_section_field.dart';
@@ -325,6 +326,8 @@ class _SettingsPageBodyState extends ConsumerState<SettingsPageBody> {
                             ),
                           ),
                         ),
+                        const SizedBox(height: 18),
+                        const ReliabilitySettingsSection(),
                       ],
                     ),
                   ),
