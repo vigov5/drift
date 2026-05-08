@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../features/receive/application/pairing_cache.dart';
 import '../features/settings/application/repository.dart';
 import '../features/settings/application/state.dart';
 import '../platform/android_media_store.dart';
@@ -43,6 +44,7 @@ Future<AppBootstrap> loadAppBootstrap({
         defaultDownloadRoot ?? await resolvePreferredReceiveDownloadRoot(),
   );
   final initialSettings = await repository.loadOrCreate();
+  final pairingCache = PairingCacheRepository(prefs: prefs);
   return AppBootstrap(
     settingsRepository: repository,
     initialSettings: initialSettings,
@@ -53,6 +55,7 @@ Future<AppBootstrap> loadAppBootstrap({
                 androidReceiveCacheDir ?? initialSettings.downloadRoot,
             serverUrl: initialSettings.discoveryServerUrl,
             androidReceiveCacheDir: androidReceiveCacheDir,
+            pairingCache: pairingCache,
           )
           ..androidSaveUri =
               (androidReceiveCacheDir != null &&

@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
+import '../../../features/receive/application/pairing_cache.dart';
 import '../../../features/receive/application/state.dart';
 import '../../../src/rust/api/lan.dart' as rust_lan;
 import '../../../src/rust/api/receiver.dart' as rust_receiver;
@@ -33,12 +34,29 @@ class RustReceiverServiceSource implements ReceiverServiceSource {
     required this.downloadRoot,
     this.serverUrl,
     this.androidReceiveCacheDir,
+    this.pairingCache,
     ReceiverPairingStreamFactory? pairingStreamFactory,
     ReceiverTransferStreamFactory? transferStreamFactory,
   }) : _pairingStreamFactory =
            pairingStreamFactory ?? rust_receiver.watchReceiverPairing,
        _transferStreamFactory =
-           transferStreamFactory ?? rust_receiver.startReceiverTransferListener;
+           transferStreamFactory ?? rust_receiver.startReceiverTransferListener {
+    final seeded = pairingCache?.loadIfFresh(
+      identity: PairingCacheRepository.buildIdentity(
+        deviceName: deviceName,
+        serverUrl: serverUrl,
+      ),
+    );
+    if (seeded != null && seeded.isAvailable) {
+      _currentState = ReceiverServiceState.ready(
+        code: seeded.normalizedCode,
+        expiresAt: seeded.expiresAt,
+      );
+      debugPrint(
+        '[receiver] seeded ready state from pairing cache code="${seeded.formattedCode}"',
+      );
+    }
+  }
 
   String deviceName;
   String downloadRoot;
@@ -48,6 +66,12 @@ class RustReceiverServiceSource implements ReceiverServiceSource {
   /// [downloadRoot].  After each transfer completes, files are moved to the
   /// public Downloads/Drift/ folder via MediaStore.
   final String? androidReceiveCacheDir;
+
+  /// Optional persistent cache for the most recent successful pairing code.
+  /// When supplied, the source seeds [currentState] from it on construction
+  /// so the UI can show "Ready" immediately on cold start instead of waiting
+  /// for the network roundtrip to the rendezvous server.
+  final PairingCacheRepository? pairingCache;
 
   /// When the user has chosen a save folder via [AndroidMediaStore.pickSaveFolder],
   /// this holds the persisted SAF tree URI.  If null, files are saved to the
@@ -142,11 +166,26 @@ class RustReceiverServiceSource implements ReceiverServiceSource {
       'to device="$deviceName" downloadRoot="$downloadRoot" '
       'serverUrl="${serverUrl ?? _resolvedServerUrl}"',
     );
+    final identityChanged =
+        previousDeviceName != deviceName || previousServerUrl != serverUrl;
+    if (identityChanged) {
+      // Old code is no longer valid against the new identity — invalidate the
+      // cache and force the visual state back to Registering until the new
+      // pairing stream emits a fresh code.
+      final cache = pairingCache;
+      if (cache != null) {
+        unawaited(cache.clear());
+      }
+    }
+
     final generation = ++_configGeneration;
 
     if (_pairingSubscription != null) {
       debugPrint('[receiver] restarting pairing stream');
-      _restartPairingSubscription(generation: generation);
+      _restartPairingSubscription(
+        generation: generation,
+        forceReset: identityChanged,
+      );
     }
     if (_transferSubscription != null) {
       debugPrint('[receiver] restarting transfer stream');
@@ -198,13 +237,21 @@ class RustReceiverServiceSource implements ReceiverServiceSource {
     await rust_receiver.setReceiverDiscoverable(enabled: false);
   }
 
-  void _restartPairingSubscription({required int generation}) {
+  void _restartPairingSubscription({
+    required int generation,
+    bool forceReset = false,
+  }) {
     final oldSubscription = _pairingSubscription;
     debugPrint('[receiver] pairing stream generation=$generation start');
     _pairingSubscription = null;
-    _currentState = const ReceiverServiceState.registering();
-    if (!_stateController.isClosed) {
-      _stateController.add(_currentState);
+    // Preserve a cached/live Ready code across reconnects; only flip to the
+    // visual Registering state if there's nothing usable to show or the caller
+    // explicitly requested a reset (e.g. identity changed).
+    if (forceReset || !_currentState.pairingCode.isAvailable) {
+      _currentState = const ReceiverServiceState.registering();
+      if (!_stateController.isClosed) {
+        _stateController.add(_currentState);
+      }
     }
     final stream = _pairingStreamFactory(
       serverUrl: _resolvedServerUrl,
@@ -221,9 +268,36 @@ class RustReceiverServiceSource implements ReceiverServiceSource {
           return;
         }
         final nextState = mapReceiverPairingState(pairing);
+        // Don't downgrade a usable cached/live code to Unavailable on transient
+        // empty events from the stream — keep the existing Ready state and
+        // wait for a real refresh. Only accept transitions that actually carry
+        // a code, plus terminal failures via onError.
+        if (!nextState.pairingCode.isAvailable &&
+            _currentState.pairingCode.isAvailable) {
+          debugPrint(
+            '[receiver] pairing stream generation=$generation ignored empty event '
+            '(keeping cached ready code)',
+          );
+          return;
+        }
         _currentState = nextState;
         if (!_stateController.isClosed) {
           _stateController.add(nextState);
+        }
+        if (nextState.pairingCode.isAvailable) {
+          final cache = pairingCache;
+          if (cache != null) {
+            unawaited(
+              cache.save(
+                identity: PairingCacheRepository.buildIdentity(
+                  deviceName: deviceName,
+                  serverUrl: serverUrl,
+                ),
+                code: nextState.pairingCode.normalizedCode,
+                expiresAt: nextState.pairingCode.expiresAt,
+              ),
+            );
+          }
         }
       },
       onError: (_) {
@@ -231,6 +305,11 @@ class RustReceiverServiceSource implements ReceiverServiceSource {
           return;
         }
         debugPrint('[receiver] pairing stream generation=$generation error');
+        // Same anti-flicker rule: don't blow away a cached Ready code just
+        // because the stream errored — the next reconnect will refresh it.
+        if (_currentState.pairingCode.isAvailable) {
+          return;
+        }
         _currentState = const ReceiverServiceState.unavailable();
         if (!_stateController.isClosed) {
           _stateController.add(_currentState);
